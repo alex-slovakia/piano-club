@@ -6,14 +6,20 @@ export const isBlack=n=>[1,3,6,8,10].includes(n%12);
 // A stable exact match is required, followed by release before the next step.
 export class NoteGate {
   constructor(holdMs=100){this.holdMs=holdMs;this.reset();}
-  reset(){this.since=null;this.release=[];this.quietSince=null;}
-  check(heard,expected,now){
+  reset(){this.since=null;this.release=[];this.quietSince=null;this.onsetUsed=0;}
+  check(heard,expected,now,onsetId=0){
     const actual=[...new Set(heard)].sort((a,b)=>a-b);
+    if(actual.length&&onsetId>this.onsetUsed){this.onsetUsed=onsetId;this.release=[];this.quietSince=null;}
     if(this.release.length){
+      // A new, disjoint pitch is itself evidence of release. Do not consume its
+      // attack while waiting for silence; repeat strikes still require release.
+      if(actual.length&&!actual.some(n=>this.release.includes(n))){this.release=[];this.quietSince=null;}
+      else {
       if(actual.some(n=>this.release.includes(n)))this.quietSince=null;
       else if(this.quietSince===null)this.quietSince=now;
       else if(now-this.quietSince>=65){this.release=[];this.quietSince=null;}
       this.since=null;return false;
+      }
     }
     const target=[...new Set(expected)].sort((a,b)=>a-b);
     if(!target.length||actual.length!==target.length||actual.some((n,i)=>n!==target[i])){this.since=null;return false;}
@@ -29,7 +35,7 @@ export function detectPitch(samples,sampleRate,minHz=55,maxHz=2200){
   const minLag=Math.max(2,Math.floor(sampleRate/maxHz));
   const size=Math.min(2048,samples.length-maxLag),diff=new Float32Array(maxLag+1);
   let energy=0;for(let i=0;i<size;i++)energy+=samples[i]*samples[i];
-  if(Math.sqrt(energy/size)<0.001)return null;
+  if(Math.sqrt(energy/size)<0.0002)return null;
   for(let lag=1;lag<=maxLag;lag++){let sum=0;for(let i=0;i<size;i++){const d=samples[i]-samples[i+lag];sum+=d*d;}diff[lag]=sum;}
   let running=0;diff[0]=1;
   for(let lag=1;lag<=maxLag;lag++){running+=diff[lag];diff[lag]=running?diff[lag]*lag/running:1;}

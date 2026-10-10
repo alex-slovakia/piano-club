@@ -1,5 +1,7 @@
 import {noteName,isBlack,NoteGate,PracticeSession,parseMidi,fitKeyboard,suggestFingers,practiceGroups,warmup} from './engine.js';
 import {PianoAudio} from './audio.js';
+import {DemoTimeline} from './playback.js';
+import {initLearning} from './learning.js';
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const safeUrl=s=>{try{const u=new URL(s);return u.protocol==='https:'?u.href:'#';}catch{return '#';}};
@@ -9,6 +11,7 @@ let progress=readStore('piano-progress',{}),imports=readStore('piano-imports',[]
 const audio=new PianoAudio();audio.noise=settings.noise;
 let catalog=[{...warmup,difficulty:1,color:'#f2cd73',symbol:'hello.',label:'Original warm-up',notes:warmup.notes}],filter='all',current=null,groups=[],session=null,mode='wait',hand='both',input='off',running=false,loop=false;
 let gate=new NoteGate(),wrongSince=null,lastWrong='',pressed=new Set(),touchTimer=null,watchTimer=null,wakeLock=null,requestSerial=0,importTarget=null,frameId=0,lastFrame=0,visualIndex=0,keyLayout=[],canvasWidth=0,canvasHeight=0,notesCache=new Map(),toastTimer,calibrating=false;
+let demo=null,micTesting=false,micStarted=0,lastClip=0,runSerial=0;
 const colors=['#f89479','#a6dace','#c8b9e7','#eed48b','#a6c0e1','#b5cf93','#ecc7b1','#b2cac9'];
 const symbols=['E!','≈','♡','♫','M.','⚑','rag.','❄','☀','III','▦','♪','1,000','fin.','S.','⅞'];
 function save(key,value){try{localStorage.setItem(key,JSON.stringify(value));return true;}catch{toast('Storage is full or blocked. Export a backup to keep your progress.');return false;}}
@@ -44,7 +47,9 @@ function noteIds(){return groups[session?.index]?.notes||[];}
 async function openPlayer(song,newMode='wait'){
   const serial=++requestSerial;stop();
   try{
+    const unlocked=newMode==='watch'?audio.unlock():null;
     const raw=await loadNotes(song);if(serial!==requestSerial)return;
+    if(unlocked)await unlocked;if(serial!==requestSerial)return;
     const trim=progress[song.id]?.trim??song.trim??0;
     let selected=raw.filter(n=>n.time+0.035>=trim);if(!selected.length)throw Error('Start time is after the last note. Choose an earlier start.');
     const base=selected[0].time;selected=selected.map(n=>({...n,time:Math.max(0,n.time-base)}));
@@ -52,14 +57,16 @@ async function openPlayer(song,newMode='wait'){
     current={...song,prepared};mode=newMode;hand='both';input='off';$('#library').hidden=true;$('#player').hidden=false;document.body.style.background='#152426';
     $('#player-name').textContent=song.title;$('#player-artist').textContent=`${song.artist} · 61 keys · ${settings.recognition==='single'?'single-note steps':'chord practice'}`;
     rebuildGroups();syncControls();window.scrollTo(0,0);requestAnimationFrame(()=>{layoutKeyboard();animate(performance.now());});
+    if(newMode==='watch')await start();
   }catch(e){toast(e.message);}
 }
 function rebuildGroups(){
-  groups=practiceGroups(current.prepared,hand,settings.recognition==='single');
+  groups=practiceGroups(current.prepared,hand,mode!=='watch'&&settings.recognition==='single');
   if(!groups.length){toast('This arrangement has no notes for that hand.');hand='both';groups=practiceGroups(current.prepared,hand,settings.recognition==='single');}
-  session=new PracticeSession(groups.length,0,mode==='seven'?Math.min(groups.length-1,7):groups.length-1);gate.reset();visualIndex=0;updatePlayer();
+  session=new PracticeSession(groups.length,0,mode==='seven'?Math.min(groups.length-1,7):groups.length-1);demo=null;gate.reset();visualIndex=0;updatePlayer();
 }
 function syncControls(){
+  if(current)$('#player-artist').textContent=`${current.artist} · 61 keys · ${mode==='watch'?'demo':settings.recognition==='single'?'single-note steps':'chord practice'}`;
   $$('[data-mode]').forEach(b=>{const selected=b.dataset.mode===mode;b.classList.toggle('selected',selected);b.setAttribute('aria-pressed',selected);});
   $$('[data-hand]').forEach(b=>{const selected=b.dataset.hand===hand;b.classList.toggle('selected',selected);b.setAttribute('aria-pressed',selected);});
   $('#streak').hidden=mode!=='seven';$('#next-section').hidden=mode!=='seven'||!session.mastered||session.end===groups.length-1;
@@ -67,7 +74,7 @@ function syncControls(){
   $('#start-listening span').textContent=running?'Pause':mode==='watch'?'Play demo':input==='touch'?'Resume touch piano':'Start microphone';
   $('#start-listening svg use').setAttribute('href',mode==='watch'?'#i-play':'#i-mic');
   $('#touch-mode').textContent=input==='touch'?'Use microphone':'Try on screen';$('#touch-mode').hidden=mode==='watch';
-  $('#mode-description').textContent=mode==='seven'?'7 clean repeats. A wrong note resets the streak to zero. Pauses are okay.':mode==='watch'?'Demo playback. Listen and follow along; this does not count as practice.':'The notes wait for you. Play the highlighted keys, then release.';
+  $('#mode-description').textContent=mode==='seven'?'7 clean repeats. A wrong note resets the streak to zero. Pauses are okay.':mode==='watch'?'Watch the notes meet the keys. Speed changes playback; your mic stays off.':'Play one highlighted note at a time. C4 is middle C. Repeat notes need a release.';
 }
 function updatePlayer(){
   if(!session)return;$('#section-label').textContent=`SECTION ${Math.floor(session.start/Math.max(1,session.end-session.start+1))+1} · ${session.start+1}–${session.end+1}`;$('#step-label').textContent=`Step ${session.index+1} of ${groups.length}`;
@@ -86,36 +93,55 @@ function editFinger(id){
   $$('#finger-options button').forEach(b=>b.onclick=()=>{note.finger=Number(b.dataset.finger);fingerings[current.id]={...fingerings[current.id],[id]:note.finger};save('piano-fingers',fingerings);$('#finger-dialog').close();updatePlayer();});$('#finger-dialog').showModal();
 }
 function stop(){
+  runSerial++;
+  document.dispatchEvent(new Event('piano:stop-extra-audio'));
+  if(demo?.playing)demo.pause(audio.context?.currentTime||0);
+  micTesting=false;if($('#mic-test'))$('#mic-test').textContent='Test microphone';
   running=false;audio.stopMic();audio.stopVoices();clearInterval(touchTimer);clearTimeout(watchTimer);touchTimer=null;watchTimer=null;pressed.clear();wrongSince=null;lastWrong='';gate.reset();
   if(wakeLock){wakeLock.release().catch(()=>{});wakeLock=null;}
-  $('#meter-fill').style.width='0';$('#heard').textContent='Microphone is off';status('Paused. Ready when you are.');if(current)syncControls();
+  $('#meter-fill').style.width='0';$('#heard').textContent='Microphone is off';$('#mic-hint').textContent='';status('Paused. Ready when you are.');if(current)syncControls();
 }
 async function keepAwake(){try{if('wakeLock' in navigator)wakeLock=await navigator.wakeLock.request('screen');}catch{}}
 async function start(){
   if(running){stop();return;}if(!current||session.mastered&&mode==='seven'){toast('Section mastered. Choose Next section or restart.');return;}
-  if(mode==='watch'){input='off';running=true;await audio.unlock();keepAwake();status('Watch & listen',true);syncControls();playWatch();return;}
-  if(input==='touch'){running=true;await audio.unlock();keepAwake();gate.reset();gate.holdMs=0;touchTimer=setInterval(()=>processNotes([...pressed],.1),35);status('Tap the highlighted keys.',true);$('#heard').textContent='Touch piano · microphone off';syncControls();return;}
+  const ticket=++runSerial;
+  if(mode==='watch'){input='off';await audio.unlock();if(ticket!==runSerial)return;running=true;if(!demo||demo.finished(audio.context.currentTime))demo=new DemoTimeline(groups,session.start,session.end);demo.play(audio.context.currentTime,settings.speed/100);keepAwake();status('Demo playing · follow the colors',true);$('#heard').textContent='Demo audio · microphone off';syncControls();playWatch();return;}
+  if(input==='touch'){await audio.unlock();if(ticket!==runSerial)return;running=true;keepAwake();gate.reset();gate.holdMs=0;touchTimer=setInterval(()=>processNotes([...pressed],.1),35);status('Tap the highlighted keys.',true);$('#heard').textContent='Touch piano · microphone off';syncControls();return;}
   input='mic';$('#start-listening').disabled=true;status('Waiting for microphone permission…');
   try{const started=await audio.listen(frame=>{
     if(frame.interrupted){if(running){stop();toast('Audio was interrupted. Tap Start microphone to resume.');}return;}
-    $('#meter-fill').style.width=Math.min(100,frame.level*500)+'%';
-    if(!calibrating&&running)processNotes(frame.notes,frame.level);
+    if(!calibrating&&running)processNotes(frame.notes,frame.level,frame.onsetId);
+    showMicFrame(frame);
   },{mode:settings.recognition,sensitivity:settings.sensitivity,onEnded:()=>{stop();toast('Microphone disconnected. Tap Start microphone to reconnect.');}});
-    if(started){running=true;gate.reset();gate.holdMs=100;keepAwake();status('Listening. Your turn.',true);syncControls();}
+    if(started&&ticket===runSerial){running=true;micStarted=performance.now();lastClip=0;gate.reset();gate.holdMs=80;keepAwake();status('Listening. Your turn.',true);syncControls();}
   }catch(e){input='off';status('Microphone unavailable');toast(e.message);}finally{$('#start-listening').disabled=false;}
 }
-function processNotes(notes,level){
+function showMicFrame(frame){
+  const now=performance.now();if(frame.clipping)lastClip=now;
+  const meter=Math.max(0,Math.min(100,(frame.db+65)/55*100));
+  $('#meter-fill').style.width=meter+'%';$('#meter-fill').classList.toggle('clipping',frame.clipping);
+  const heard=frame.notes.length?'Heard '+frame.notes.map(noteName).join(' + ')+(frame.pitch?' · '+Math.round(frame.pitch.hz)+' Hz':''):frame.level>.00045?'Sound received · finding a clear note':'No note heard';
+  $('#heard').textContent=heard+' · '+frame.db+' dB';
+  let hint='';
+  if(frame.muted)hint='Safari has muted the microphone. Check microphone access and tap Pause, then Start.';
+  else if(lastClip>0&&now-lastClip<1200)hint='Sound is distorting. Lower the keyboard volume or move the phone farther away.';
+  else if(now-micStarted>2500&&frame.level<.00045)hint='Very quiet input. Move closer to the speaker; use Standard mic mode in iPhone Control Center.';
+  else if(frame.level>.004&&!frame.notes.length)hint='Use a plain piano sound. Play one key, without backing music or effects.';
+  $('#mic-hint').textContent=hint;
+  if(micTesting){$('#mic-test-note').textContent=frame.notes.length?frame.notes.map(noteName).join(' + '):'—';$('#mic-test-details').textContent=heard+' · '+frame.db+' dB · '+Math.round(frame.sampleRate/1000)+' kHz';$('#mic-test-hint').textContent=hint||'Play any single key. Middle C is C4, the third C from the left on your 61-key keyboard.';$('#mic-test-meter i').style.width=meter+'%';}
+}
+function processNotes(notes,level,onsetId=0){
   if(!running||session.mastered&&mode==='seven')return;const now=performance.now(),target=noteIds().map(n=>n.pitch);
   $('#heard').textContent=notes.length?'Heard '+notes.map(noteName).join(' + '):input==='touch'?'Touch piano · microphone off':level>audio.noise*2?'Listening for a clear pitch…':'Listening…';
   const wasReleasing=gate.release.length>0;
-  if(gate.check(notes,target,now)){advance();return;}
-  if(wasReleasing){status('Release the keys, then play again.',true);wrongSince=null;return;}
+  if(gate.check(notes,target,now,onsetId)){advance();return;}
+  if(wasReleasing&&gate.release.length){status('Release the keys, then play again.',true);wrongSince=null;return;}
   const wrong=notes.filter(n=>!target.includes(n));
   if(wrong.length){
     const key=wrong.join(',');if(key!==lastWrong){wrongSince=now;lastWrong=key;}
     if(input==='touch'||now-wrongSince>140){
       if(mode==='seven'){
-        session.mistake();gate.reset();gate.release=[...notes];visualIndex=session.start;updatePlayer();status('Wrong note. Streak reset — fresh start.');toast('Streak reset to 0 / 7. Begin this section again.');
+        session.mistake();gate.reset();gate.release=[...notes];gate.onsetUsed=onsetId;visualIndex=session.start;updatePlayer();status('Wrong note. Streak reset — fresh start.');toast('Streak reset to 0 / 7. Begin this section again.');
       }else status('Not quite. Try '+target.map(noteName).join(' + ')+'.');
       wrongSince=null;lastWrong='';
     }
@@ -131,16 +157,23 @@ function advance(){
   else status('Good note. Release, then continue.',true);
 }
 function playWatch(){
-  if(!running||mode!=='watch')return;const group=groups[session.index];for(const n of group.notes)audio.play(n.pitch,Math.min(2.5,n.duration/(settings.speed/100)),.14/Math.sqrt(group.notes.length));updatePlayer();
-  const next=groups[session.index+1];const interval=Math.max(.16,Math.min(3,next?next.time-group.time:1))/(settings.speed/100);
-  watchTimer=setTimeout(()=>{const result=session.correct('watch',loop);if(result==='finished'){stop();status('Demo finished. Try it yourself.');return;}if(result==='repeat')visualIndex=session.start;playWatch();},interval*1000);
+  if(!running||mode!=='watch'||!demo)return;
+  if(audio.context.state!=='running'){stop();status('Audio paused by Safari. Tap Play demo to resume.');return;}
+  const now=audio.context.currentTime;
+  for(const event of demo.due(now))for(const n of event.group.notes)audio.play(n.pitch,Math.max(.08,n.duration/demo.rate),.14/Math.sqrt(event.group.notes.length),event.delay);
+  const index=demo.index(now);if(index!==session.index){session.index=index;updatePlayer();}
+  if(demo.finished(now)){
+    if(loop){demo=new DemoTimeline(groups,session.start,session.end);demo.play(now,settings.speed/100);session.index=session.start;updatePlayer();}
+    else{stop();demo=null;status('Demo finished. Try it yourself.');return;}
+  }
+  watchTimer=setTimeout(playWatch,25);
 }
 function layoutKeyboard(){
-  if(!current||!groups.length)return;const width=$('#roll-container').clientWidth;const target=noteIds().map(n=>n.pitch);const upcoming=groups.slice(session.index,session.index+8).flatMap(g=>g.notes.map(n=>n.pitch));
-  const min=Math.min(...target,...upcoming),max=Math.max(...target,...upcoming);const span=width<600?24:36;let low=Math.max(36,Math.floor((min-2)/12)*12),high=Math.min(96,Math.max(low+span,max+2));if(high-low>48&&width<600){low=Math.max(36,Math.floor(min/12)*12);high=Math.min(96,max+1);}if(high-low<span)low=Math.max(36,high-span);
+  if(!current||!groups.length)return;const width=$('#roll-container').clientWidth;
+  const low=36,high=96;
   const white=[];for(let p=low;p<=high;p++)if(!isBlack(p))white.push(p);const keyW=width/white.length;keyLayout=[];let whiteIndex=0;
   for(let pitch=low;pitch<=high;pitch++){const black=isBlack(pitch),x=black?(whiteIndex-.31)*keyW:whiteIndex*keyW,w=black?keyW*.62:keyW;if(!black)whiteIndex++;keyLayout.push({pitch,x,w,black});}
-  $('#keyboard').innerHTML=keyLayout.map(k=>`<button class="piano-key ${k.black?'black':''}" data-pitch="${k.pitch}" aria-label="Play ${noteName(k.pitch)}" style="left:${k.x}px;width:${k.w}px">${!k.black&&settings.labels?noteName(k.pitch):''}</button>`).join('');
+  $('#keyboard').innerHTML=keyLayout.map(k=>`<button class="piano-key ${k.black?'black':''} ${k.pitch===60?'middle-c':''}" data-pitch="${k.pitch}" aria-label="Play ${noteName(k.pitch)}" style="left:${k.x}px;width:${k.w}px">${!k.black&&settings.labels?`<span>${noteName(k.pitch).replace(/\d/g,'')}<small>${k.pitch%12===0?Math.floor(k.pitch/12)-1:''}</small></span>`:''}</button>`).join('');
   $$('.piano-key').forEach(button=>{button.onpointerdown=e=>{e.preventDefault();if(input!=='touch'||!running){toast('Choose “Try on screen” to play these keys.');return;}const pitch=Number(button.dataset.pitch);button.setPointerCapture(e.pointerId);pressed.add(pitch);button.classList.add('pressed');audio.play(pitch,.7,.2);processNotes([...pressed],.1);};const release=()=>{pressed.delete(Number(button.dataset.pitch));button.classList.remove('pressed');};button.onpointerup=release;button.onpointercancel=release;button.onlostpointercapture=release;button.onkeydown=e=>{if((e.key==='Enter'||e.key===' ')&&!e.repeat&&input==='touch'&&running){e.preventDefault();pressed.add(Number(button.dataset.pitch));audio.play(Number(button.dataset.pitch));processNotes([...pressed],.1);}};button.onkeyup=release;});
   const canvas=$('#roll');canvasWidth=width;canvasHeight=canvas.clientHeight;const dpr=Math.min(window.devicePixelRatio||1,2);canvas.width=canvasWidth*dpr;canvas.height=canvasHeight*dpr;canvas.getContext('2d').setTransform(dpr,0,0,dpr,0,0);
   $$('.piano-key').forEach(b=>{const n=noteIds().find(n=>n.pitch===Number(b.dataset.pitch));if(n)b.classList.add('target-'+n.hand);});
@@ -150,13 +183,17 @@ function animate(now){
   const delta=Math.min(60,now-lastFrame||16);lastFrame=now;const desired=session.index;visualIndex+=Math.max(-1,Math.min(1,desired-visualIndex))*Math.min(1,delta/140*(settings.speed/60));if(Math.abs(desired-visualIndex)<.01)visualIndex=desired;
   ctx.clearRect(0,0,w,h);ctx.strokeStyle='#ffffff08';ctx.lineWidth=1;
   for(const k of keyLayout.filter(k=>!k.black)){ctx.beginPath();ctx.moveTo(k.x,0);ctx.lineTo(k.x,h);ctx.stroke();}
-  const spacing=Math.max(44,h/5.8),end=Math.min(groups.length,session.index+9,session.end+1);
-  for(let i=end-1;i>=session.index;i--){const y=h-5-(i-visualIndex)*spacing;if(y<-80)continue;
-    for(const n of groups[i].notes){const k=keyLayout.find(k=>k.pitch===n.pitch);if(!k)continue;const barHeight=Math.min(78,Math.max(42,n.duration*55)),barWidth=Math.max(8,k.w-(k.black?2:5)),x=k.x+(k.w-barWidth)/2;
+  const watching=mode==='watch'&&demo,scoreTime=watching?demo.position(audio.context?.currentTime||0):0,pps=Math.max(25,h/4),active=new Map();
+  const spacing=Math.max(44,h/5.8),end=watching?Math.min(groups.length,session.index+140,session.end+1):Math.min(groups.length,session.index+9,session.end+1),begin=watching?Math.max(session.start,session.index-40):session.index;
+  for(let i=end-1;i>=begin;i--){const y=watching?h-(groups[i].time-scoreTime)*pps:h-5-(i-visualIndex)*spacing;if(y<-120)continue;
+    for(const n of groups[i].notes){const k=keyLayout.find(k=>k.pitch===n.pitch);if(!k)continue;const barHeight=watching?Math.max(10,n.duration*pps):Math.min(78,Math.max(42,n.duration*55)),barWidth=Math.max(4,k.w-(k.black?1:2)),x=k.x+(k.w-barWidth)/2;
+      if(watching&&groups[i].time<=scoreTime&&groups[i].time+n.duration>scoreTime)active.set(n.pitch,n.hand);
+      if(y-barHeight>h)continue;
       ctx.fillStyle=n.hand==='left'?'#80d8c4':'#fc795e';ctx.globalAlpha=i===session.index?1:.8;ctx.beginPath();ctx.roundRect(x,y-barHeight,barWidth,barHeight,Math.min(5,barWidth/3));ctx.fill();ctx.globalAlpha=1;
-      if(settings.labels&&barWidth>14){ctx.fillStyle='#17352f';ctx.font=`600 ${Math.min(12,barWidth*.4)}px 'DM Sans',sans-serif`;ctx.textAlign='center';ctx.fillText(noteName(n.pitch).replace(/\d/g,''),x+barWidth/2,y-barHeight+14);if(n.finger&&barHeight>34){ctx.font=`700 ${Math.min(11,barWidth*.45)}px 'DM Sans',sans-serif`;ctx.fillText(n.finger,x+barWidth/2,y-9);}}
+      if(settings.labels&&barWidth>7&&barHeight>20){ctx.fillStyle='#17352f';ctx.font=`600 ${Math.max(7,Math.min(12,barWidth*.55))}px 'DM Sans',sans-serif`;ctx.textAlign='center';ctx.fillText(noteName(n.pitch).replace(/\d/g,''),x+barWidth/2,y-barHeight+13);if(n.finger&&barHeight>34){ctx.font=`700 ${Math.max(7,Math.min(11,barWidth*.55))}px 'DM Sans',sans-serif`;ctx.fillText(n.finger,x+barWidth/2,Math.min(h-8,y-9));}}
     }
   }
+  if(watching){$$('.piano-key').forEach(b=>{const hand=active.get(Number(b.dataset.pitch));b.classList.toggle('target-left',hand==='left');b.classList.toggle('target-right',hand==='right');});$('#heard').textContent=`Demo ${durationText(Math.max(0,scoreTime))} · microphone off`;}
   frameId=requestAnimationFrame(animate);
 }
 
@@ -170,6 +207,13 @@ $('#calibrate').onclick=async()=>{
   if(calibrating)return;stop();calibrating=true;$('#calibrate').disabled=true;$('#calibration-status').textContent='Allow the microphone, then keep the room quiet for 2 seconds.';const levels=[];
   try{await audio.listen(f=>levels.push(f.level),{mode:'single',sensitivity:settings.sensitivity});await new Promise(resolve=>setTimeout(resolve,2200));if(levels.length<10)throw Error('Calibration was interrupted. Try again.');levels.sort((a,b)=>a-b);settings.noise=Math.max(.001,levels[Math.floor(levels.length*.8)]);audio.noise=settings.noise;saveSettings();$('#calibration-status').textContent='Room calibrated. Play at a comfortable volume near your phone. Start microphone when ready.';}catch(e){$('#calibration-status').textContent=e.message;}finally{audio.stopMic();calibrating=false;$('#calibrate').disabled=false;}
 };
+$('#mic-test').onclick=async()=>{
+  if(calibrating)return;
+  if(micTesting){stop();return;}stop();micTesting=true;micStarted=performance.now();$('#mic-test-panel').hidden=false;$('#mic-test').textContent='Stop mic test';$('#mic-test-note').textContent='…';$('#mic-test-hint').textContent='Allow the microphone, then play a single key.';
+  try{const started=await audio.listen(frame=>{if(frame.interrupted){$('#mic-test-hint').textContent='Safari interrupted audio. Stop this test and tap Test microphone again.';return;}showMicFrame(frame);},{mode:'single',sensitivity:settings.sensitivity,onEnded:()=>{stop();$('#mic-test-hint').textContent='Microphone disconnected. Start the test again.';}});if(!started)stop();}
+  catch(e){stop();$('#mic-test-hint').textContent=e.message;}
+};
+$('#settings-dialog').addEventListener('close',()=>{if(micTesting||calibrating)stop();});
 $('#guide-nav').onclick=()=>$('#guide-dialog').showModal();$('#library-nav').onclick=()=>window.scrollTo({top:0,behavior:'smooth'});
 $$('.close-dialog').forEach(b=>b.onclick=()=>b.closest('dialog').close());
 $$('dialog').forEach(d=>d.addEventListener('click',e=>{if(e.target===d){const r=d.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)d.close();}}));
@@ -177,13 +221,13 @@ $('#start-warmup').onclick=()=>openPlayer(catalog[0]);$('#seven-start').onclick=
 $('#back-library').onclick=()=>{requestSerial++;stop();cancelAnimationFrame(frameId);current=null;$('#player').hidden=true;$('#library').hidden=false;document.body.style.background='';renderLibrary();};
 $('#start-listening').onclick=()=>start().catch(e=>{stop();toast(e.message);});
 $('#touch-mode').onclick=()=>{stop();input=input==='touch'?'mic':'touch';if(input==='touch')start().catch(e=>toast(e.message));else syncControls();};
-$$('[data-mode]').forEach(b=>b.onclick=()=>{stop();mode=b.dataset.mode;session.setSection(0,mode==='seven'?Math.min(groups.length-1,7):groups.length-1);loop=false;visualIndex=session.index;updatePlayer();});
+$$('[data-mode]').forEach(b=>b.onclick=async()=>{stop();mode=b.dataset.mode;loop=false;rebuildGroups();layoutKeyboard();if(mode==='watch')try{await start();}catch(e){stop();toast(e.message);}});
 $$('[data-hand]').forEach(b=>b.onclick=()=>{stop();hand=b.dataset.hand;rebuildGroups();layoutKeyboard();});
-$('#restart').onclick=()=>{stop();session.setSection(session.start,session.end);visualIndex=session.start;updatePlayer();status('Fresh start. Ready when you are.');};
+$('#restart').onclick=()=>{stop();demo=null;session.setSection(session.start,session.end);visualIndex=session.start;updatePlayer();status('Fresh start. Ready when you are.');};
 $('#next-section').onclick=()=>{if(session.next()){stop();visualIndex=session.start;updatePlayer();layoutKeyboard();status('Next section unlocked. Ready when you are.');}};
-$('#speed').oninput=e=>{settings.speed=Number(e.target.value);saveSettings();syncControls();};
+$('#speed').oninput=e=>{settings.speed=Number(e.target.value);if(demo)demo.speed(settings.speed/100,audio.context?.currentTime||0);saveSettings();syncControls();};
 $('#section-button').onclick=()=>{stop();$('#section-from').value=session.start+1;$('#section-to').value=session.end+1;$('#section-from').max=groups.length;$('#section-to').max=groups.length;$('#loop-section').checked=loop;$('#section-dialog').showModal();};
-$('#apply-section').onclick=()=>{const from=Number($('#section-from').value),to=Number($('#section-to').value);if(!Number.isInteger(from)||!Number.isInteger(to)||from<1||to<from||to>groups.length){toast(`Choose a valid range from 1 to ${groups.length}.`);return;}loop=$('#loop-section').checked;session.setSection(from-1,to-1);visualIndex=session.start;updatePlayer();layoutKeyboard();$('#section-dialog').close();};
+$('#apply-section').onclick=()=>{const from=Number($('#section-from').value),to=Number($('#section-to').value);if(!Number.isInteger(from)||!Number.isInteger(to)||from<1||to<from||to>groups.length){toast(`Choose a valid range from 1 to ${groups.length}.`);return;}loop=$('#loop-section').checked;demo=null;session.setSection(from-1,to-1);visualIndex=session.start;updatePlayer();layoutKeyboard();$('#section-dialog').close();};
 $('#search').oninput=renderLibrary;$$('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;$$('[data-filter]').forEach(x=>x.classList.toggle('selected',x===b));renderLibrary();});
 $('#import-button').onclick=()=>{importTarget=null;$('#midi-file').click();};
 $('#midi-file').onchange=async e=>{
@@ -198,4 +242,5 @@ document.addEventListener('visibilitychange',()=>{if(document.hidden&&(running||
 window.addEventListener('pagehide',()=>stop());window.addEventListener('resize',()=>{if(current)layoutKeyboard();});
 try{const r=await fetch('./catalog.json');if(!r.ok)throw Error();const data=await r.json();catalog.push(...data.songs);}catch{toast('Song library could not load. The warm-up is still available.');}
 renderLibrary();
+initLearning({openPlayer,audio,stop,toast});
 if('serviceWorker' in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{});
