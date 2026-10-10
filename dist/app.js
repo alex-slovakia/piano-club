@@ -7,7 +7,7 @@ function readStore(key,fallback){try{return JSON.parse(localStorage.getItem(key)
 let settings={recognition:'single',sensitivity:5,labels:true,split:60,speed:60,noise:.003,...readStore('piano-settings',{})};
 let progress=readStore('piano-progress',{}),imports=readStore('piano-imports',[]),fingerings=readStore('piano-fingers',{});
 const audio=new PianoAudio();audio.noise=settings.noise;
-let catalog=[{...warmup,difficulty:1,color:'#f2cd73',symbol:'hello.',label:'Original warm-up',notes:warmup.notes}],filter='all',current=null,groups=[],session=null,mode='wait',hand='both',input='off',running=false,loop=true;
+let catalog=[{...warmup,difficulty:1,color:'#f2cd73',symbol:'hello.',label:'Original warm-up',notes:warmup.notes}],filter='all',current=null,groups=[],session=null,mode='wait',hand='both',input='off',running=false,loop=false;
 let gate=new NoteGate(),wrongSince=null,lastWrong='',pressed=new Set(),touchTimer=null,watchTimer=null,wakeLock=null,requestSerial=0,importTarget=null,frameId=0,lastFrame=0,visualIndex=0,keyLayout=[],canvasWidth=0,canvasHeight=0,notesCache=new Map(),toastTimer,calibrating=false;
 const colors=['#f89479','#a6dace','#c8b9e7','#eed48b','#a6c0e1','#b5cf93','#ecc7b1','#b2cac9'];
 const symbols=['E!','≈','♡','♫','M.','⚑','rag.','❄','☀','III','▦','♪','1,000','fin.','S.','⅞'];
@@ -57,7 +57,7 @@ async function openPlayer(song,newMode='wait'){
 function rebuildGroups(){
   groups=practiceGroups(current.prepared,hand,settings.recognition==='single');
   if(!groups.length){toast('This arrangement has no notes for that hand.');hand='both';groups=practiceGroups(current.prepared,hand,settings.recognition==='single');}
-  session=new PracticeSession(groups.length,0,Math.min(groups.length-1,7));gate.reset();visualIndex=0;updatePlayer();
+  session=new PracticeSession(groups.length,0,mode==='seven'?Math.min(groups.length-1,7):groups.length-1);gate.reset();visualIndex=0;updatePlayer();
 }
 function syncControls(){
   $$('[data-mode]').forEach(b=>{const selected=b.dataset.mode===mode;b.classList.toggle('selected',selected);b.setAttribute('aria-pressed',selected);});
@@ -177,7 +177,7 @@ $('#start-warmup').onclick=()=>openPlayer(catalog[0]);$('#seven-start').onclick=
 $('#back-library').onclick=()=>{requestSerial++;stop();cancelAnimationFrame(frameId);current=null;$('#player').hidden=true;$('#library').hidden=false;document.body.style.background='';renderLibrary();};
 $('#start-listening').onclick=()=>start().catch(e=>{stop();toast(e.message);});
 $('#touch-mode').onclick=()=>{stop();input=input==='touch'?'mic':'touch';if(input==='touch')start().catch(e=>toast(e.message));else syncControls();};
-$$('[data-mode]').forEach(b=>b.onclick=()=>{stop();mode=b.dataset.mode;session.setSection(session.start,session.end);visualIndex=session.index;updatePlayer();});
+$$('[data-mode]').forEach(b=>b.onclick=()=>{stop();mode=b.dataset.mode;session.setSection(0,mode==='seven'?Math.min(groups.length-1,7):groups.length-1);loop=false;visualIndex=session.index;updatePlayer();});
 $$('[data-hand]').forEach(b=>b.onclick=()=>{stop();hand=b.dataset.hand;rebuildGroups();layoutKeyboard();});
 $('#restart').onclick=()=>{stop();session.setSection(session.start,session.end);visualIndex=session.start;updatePlayer();status('Fresh start. Ready when you are.');};
 $('#next-section').onclick=()=>{if(session.next()){stop();visualIndex=session.start;updatePlayer();layoutKeyboard();status('Next section unlocked. Ready when you are.');}};
