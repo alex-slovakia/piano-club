@@ -2,6 +2,7 @@ import {noteName,isBlack,NoteGate,PracticeSession,parseMidi,fitKeyboard,suggestF
 import {PianoAudio} from './audio.js';
 import {DemoTimeline,WaitTimeline} from './playback.js';
 import {initLearning} from './learning.js';
+import {KeyboardCalibration,validKeyProfiles} from './calibration.js';
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const safeUrl=s=>{try{const u=new URL(s);return u.protocol==='https:'?u.href:'#';}catch{return '#';}};
@@ -10,8 +11,10 @@ let settings={recognition:'auto',sensitivity:5,labels:true,split:60,speed:60,noi
 // Older single-note settings also changed the score. Migrate to score-preserving
 // listening; selecting single-note listening now only changes the detector.
 if(settings.scoreVersion!==5){settings.recognition='auto';settings.scoreVersion=5;}
+if(settings.listenerVersion!==6){settings.recognition='auto';settings.listenerVersion=6;}
 let progress=readStore('piano-progress',{}),imports=readStore('piano-imports',[]),fingerings=readStore('piano-fingers',{});
 const audio=new PianoAudio();audio.noise=settings.noise;
+audio.keyProfiles=validKeyProfiles(readStore('piano-key-profiles',{}));let keyboardCalibration=null;
 let catalog=[{...warmup,difficulty:1,color:'#f2cd73',symbol:'hello.',label:'Original warm-up',notes:warmup.notes}],filter='all',current=null,groups=[],session=null,mode='wait',hand='both',input='off',running=false,loop=false;
 let gate=new NoteGate(),wrongSince=null,lastWrong='',pressed=new Set(),touchTimer=null,watchTimer=null,wakeLock=null,requestSerial=0,importTarget=null,frameId=0,keyLayout=[],canvasWidth=0,canvasHeight=0,notesCache=new Map(),toastTimer,calibrating=false;
 let demo=null,practiceClock=null,practiceSnapshot=null,micTesting=false,micStarted=0,lastClip=0,runSerial=0;
@@ -104,6 +107,7 @@ function editFinger(id){
 }
 function stop(){
   runSerial++;
+  if(keyboardCalibration){keyboardCalibration=null;calibrating=false;$('#keyboard-calibrate').textContent='Continue keyboard calibration';$('#calibration-help').textContent='Paused. Learned keys are saved on this device.';$('#calibrate').disabled=false;}
   document.dispatchEvent(new Event('piano:stop-extra-audio'));
   if(demo?.playing)demo.pause(audio.context?.currentTime||0);
   if(practiceClock?.playing)practiceClock.pause(performance.now()/1000);
@@ -123,7 +127,7 @@ async function start(){
     if(frame.interrupted){if(running){stop();toast('Audio was interrupted. Tap Start microphone to resume.');}return;}
     if(!calibrating&&running)processNotes(frame.notes,frame.level,frame.onsetId);
     showMicFrame(frame);
-  },{mode:()=>settings.recognition==='auto'?(new Set([...noteIds().map(n=>n.pitch),...heldPitches()]).size>1?'chord':'single'):settings.recognition,sensitivity:settings.sensitivity,onEnded:()=>{stop();toast('Microphone disconnected. Tap Start microphone to reconnect.');}});
+  },{mode:()=>settings.recognition==='single'&&new Set([...noteIds().map(n=>n.pitch),...heldPitches()]).size===1?'single':'chord',sensitivity:settings.sensitivity,onEnded:()=>{stop();toast('Microphone disconnected. Tap Start microphone to reconnect.');}});
     if(started&&ticket===runSerial){running=true;practiceClock??=new WaitTimeline(groups,session.index);practiceClock.play(performance.now()/1000,settings.speed/100);micStarted=performance.now();lastClip=0;gate.reset();gate.holdMs=80;keepAwake();status('Listening. Your turn.',true);syncControls();}
   }catch(e){input='off';status('Microphone unavailable');toast(e.message);}finally{$('#start-listening').disabled=false;}
 }
@@ -137,9 +141,10 @@ function showMicFrame(frame){
   if(frame.muted)hint='Safari has muted the microphone. Check microphone access and tap Pause, then Start.';
   else if(lastClip>0&&now-lastClip<1200)hint='Sound is distorting. Lower the keyboard volume or move the phone farther away.';
   else if(now-micStarted>2500&&frame.level<.00045)hint='Very quiet input. Move closer to the speaker; use Standard mic mode in iPhone Control Center.';
-  else if(frame.level>.004&&!frame.notes.length)hint='Use a plain piano sound. Play one key, without backing music or effects.';
+  else if(frame.level>.004&&!frame.notes.length)hint='Hold the keys briefly. Use a plain piano sound; keyboard calibration in Settings can help.';
+  else if(running&&current&&frame.notes.length){const missing=[...new Set(noteIds().map(n=>n.pitch))].filter(n=>!frame.notes.includes(n));if(missing.length)hint='Still listening for '+missing.map(noteName).join(' + ')+'. Hold the chord briefly.';}
   $('#mic-hint').textContent=hint;
-  if(micTesting){$('#mic-test-note').textContent=frame.notes.length?frame.notes.map(noteName).join(' + '):'—';$('#mic-test-details').textContent=heard+' · '+frame.db+' dB · '+Math.round(frame.sampleRate/1000)+' kHz';$('#mic-test-hint').textContent=hint||'Play any single key. Middle C is C4, the third C from the left on your 61-key keyboard.';$('#mic-test-meter i').style.width=meter+'%';}
+  if(micTesting){$('#mic-test-note').textContent=frame.notes.length?frame.notes.map(noteName).join(' + '):'—';$('#mic-test-details').textContent=heard+' · '+frame.db+' dB · '+Math.round(frame.sampleRate/1000)+' kHz';$('#mic-test-hint').textContent=hint||'Play a note or chord. Every detected key appears above. If a key is missing, try keyboard calibration.';$('#mic-test-meter i').style.width=meter+'%';}
 }
 function processNotes(notes,level,onsetId=0){
   if(!running||session.mastered&&mode==='seven')return;const now=performance.now(),target=noteIds().map(n=>n.pitch);
@@ -212,7 +217,7 @@ function animate(now){
   frameId=requestAnimationFrame(animate);
 }
 
-function openSettings(){if(current)stop();$('#recognition').value=settings.recognition;$('#sensitivity').value=settings.sensitivity;$('#show-labels').checked=settings.labels;$('#split-note').value=settings.split;$('#settings-dialog').showModal();}
+function openSettings(){if(current)stop();$('#recognition').value=settings.recognition;$('#sensitivity').value=settings.sensitivity;$('#show-labels').checked=settings.labels;$('#split-note').value=settings.split;const learned=Object.keys(audio.keyProfiles).length;$('#keyboard-profile-status').textContent=learned+' / 61 keys calibrated on this device';$('#keyboard-calibrate').textContent=learned===61?'Recalibrate keyboard':learned?'Continue keyboard calibration':'Calibrate my keyboard';$('#settings-dialog').showModal();}
 $('#settings-button').onclick=openSettings;$('#player-settings').onclick=openSettings;
 $('#recognition').onchange=e=>{settings.recognition=e.target.value;saveSettings();if(current){stop();syncControls();}toast('Listening updated. The score and selected section stay the same.');};
 $('#sensitivity').oninput=e=>{settings.sensitivity=Number(e.target.value);saveSettings();};
@@ -224,11 +229,35 @@ $('#calibrate').onclick=async()=>{
 };
 $('#mic-test').onclick=async()=>{
   if(calibrating)return;
-  if(micTesting){stop();return;}stop();micTesting=true;micStarted=performance.now();$('#mic-test-panel').hidden=false;$('#mic-test').textContent='Stop mic test';$('#mic-test-note').textContent='…';$('#mic-test-hint').textContent='Allow the microphone, then play a single key.';
-  try{const started=await audio.listen(frame=>{if(frame.interrupted){$('#mic-test-hint').textContent='Safari interrupted audio. Stop this test and tap Test microphone again.';return;}showMicFrame(frame);},{mode:'single',sensitivity:settings.sensitivity,onEnded:()=>{stop();$('#mic-test-hint').textContent='Microphone disconnected. Start the test again.';}});if(!started)stop();}
+  if(micTesting){stop();return;}stop();micTesting=true;micStarted=performance.now();$('#mic-test-panel').hidden=false;$('#mic-test').textContent='Stop mic test';$('#mic-test-note').textContent='…';$('#mic-test-hint').textContent='Allow the microphone, then play a note or chord.';
+  try{const started=await audio.listen(frame=>{if(frame.interrupted){$('#mic-test-hint').textContent='Safari interrupted audio. Stop this test and tap Test microphone again.';return;}showMicFrame(frame);},{mode:'chord',sensitivity:settings.sensitivity,onEnded:()=>{stop();$('#mic-test-hint').textContent='Microphone disconnected. Start the test again.';}});if(!started)stop();}
   catch(e){stop();$('#mic-test-hint').textContent=e.message;}
 };
 $('#settings-dialog').addEventListener('close',()=>{if(micTesting||calibrating)stop();});
+function showKeyboardCalibration(){
+  const calibration=keyboardCalibration;if(!calibration)return;
+  const note=calibration.note;$('#calibration-progress').value=calibration.count;
+  $('#keyboard-profile-status').textContent=calibration.count+' / 61 keys calibrated on this device';
+  $('#calibration-note').textContent=note===null?'All keys learned!':noteName(note);
+  $('#calibration-help').textContent=note===null?'Saved. Return to your piece and start the microphone. Recalibrate if you change the keyboard voice or phone position.':'Press only '+noteName(note)+' on your Yamaha and hold for about one second. Release when the highlighted key moves. Keep the same piano voice, volume and phone position you use for practice.';
+  let white=0;$('#calibration-keyboard').innerHTML=Array.from({length:61},(_,i)=>{const p=i+36,black=isBlack(p),x=(black?white-.31:white)/36*100;if(!black)white++;return `<i class="calibration-key ${black?'black':''} ${p===note?'active':''}" style="left:${x}%;width:${(black?.62:1)/36*100}%">${!black&&p%12===0?noteName(p):''}</i>`;}).join('');
+}
+$('#keyboard-calibrate').onclick=async()=>{
+  if(keyboardCalibration){stop();return;}if(calibrating)return;stop();
+  if(Object.keys(audio.keyProfiles).length===61){audio.keyProfiles={};save('piano-key-profiles',audio.keyProfiles);}
+  keyboardCalibration=new KeyboardCalibration(audio.keyProfiles);const calibration=keyboardCalibration;
+  calibrating=true;$('#calibrate').disabled=true;$('#keyboard-calibrate').textContent='Pause keyboard calibration';$('#keyboard-calibration-panel').hidden=false;showKeyboardCalibration();
+  try{
+    await audio.listen(frame=>{
+      if(keyboardCalibration!==calibration)return;
+      if(frame.interrupted){stop();return;}
+      const learned=calibration.update(frame,performance.now());
+      if(learned!==null){audio.keyProfiles={...audio.keyProfiles,...calibration.profiles};save('piano-key-profiles',audio.keyProfiles);showKeyboardCalibration();if(calibration.note===null){keyboardCalibration=null;calibrating=false;audio.stopMic();$('#calibrate').disabled=false;$('#keyboard-calibrate').textContent='Recalibrate keyboard';}}
+      else if(frame.clipping)$('#calibration-help').textContent='Input is distorting. Lower the keyboard volume slightly, then hold '+noteName(calibration.note)+'.';
+      else if(frame.notes.length&&frame.notes[0]!==calibration.note)$('#calibration-help').textContent='Heard '+frame.notes.map(noteName).join(' + ')+'. Press only '+noteName(calibration.note)+', the highlighted key.';
+    },{mode:'calibrate',sensitivity:settings.sensitivity,onEnded:()=>stop()});
+  }catch(e){stop();$('#calibration-help').textContent=e.message;}
+};
 $('#guide-nav').onclick=()=>$('#guide-dialog').showModal();$('#library-nav').onclick=()=>window.scrollTo({top:0,behavior:'smooth'});
 $$('.close-dialog').forEach(b=>b.onclick=()=>b.closest('dialog').close());
 $$('dialog').forEach(d=>d.addEventListener('click',e=>{if(e.target===d){const r=d.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)d.close();}}));

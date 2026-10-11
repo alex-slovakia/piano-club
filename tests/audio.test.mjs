@@ -2,14 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {PianoAudio,analyzeMicrophoneFrame,PianoOnsets} from '../dist/audio.js';
 import {NoteGate,frequency} from '../dist/engine.js';
+import {chordSamples,spectrumOf} from './signal-fixtures.mjs';
 
 function pianoFrame(note,noise=0,volume=.12,sampleRate=48000){
   let seed=123;const f=frequency(note);
   return Float32Array.from({length:8192},(_,i)=>{seed=(1664525*seed+1013904223)>>>0;return volume*(Math.sin(2*Math.PI*f*i/sampleRate)+.5*Math.sin(4*Math.PI*f*i/sampleRate))+noise*(seed/2**31-1);});
 }
-async function capture(t,{samples=pianoFrame(60),suspendOnCapture=false,noise=.003,sampleRate=48000,mode='single'}={}){
+async function capture(t,{samples=pianoFrame(60),spectrum=null,suspendOnCapture=false,noise=.003,sampleRate=48000,mode='single'}={}){
   let tick,spectrumReads=0;const frames=[];const track={stop(){},muted:false,readyState:'live'};
-  const ctx={state:'suspended',sampleRate,currentTime:0,destination:{},resume:async()=>{ctx.state='running';},createMediaStreamSource:()=>({connect(){},disconnect(){}}),createAnalyser:()=>({connect(){},disconnect(){},getFloatTimeDomainData(out){out.set(samples);},getFloatFrequencyData(out){spectrumReads++;out.fill(-100);}}),createGain:()=>({gain:{value:0},connect(){},disconnect(){}})};
+  const ctx={state:'suspended',sampleRate,currentTime:0,destination:{},resume:async()=>{ctx.state='running';},createMediaStreamSource:()=>({connect(){},disconnect(){}}),createAnalyser:()=>({connect(){},disconnect(){},getFloatTimeDomainData(out){out.set(samples);},getFloatFrequencyData(out){spectrumReads++;if(spectrum)out.set(spectrum);else out.fill(-100);}}),createGain:()=>({gain:{value:0},connect(){},disconnect(){}})};
   t.mock.method(globalThis,'setInterval',fn=>{tick=fn;return 123;});
   t.mock.method(globalThis,'clearInterval',()=>{});
   const oldWindow=Object.getOwnPropertyDescriptor(globalThis,'window'),oldNavigator=Object.getOwnPropertyDescriptor(globalThis,'navigator');
@@ -74,4 +75,26 @@ test('two repeated strikes advance twice despite a ringing tail; a held note adv
 test('live capture can switch listening method between notes without altering the score',async t=>{
  let queries=0;const {frames,spectrumReads}=await capture(t,{mode:()=>++queries<=4?'single':'chord'});
  assert.equal(spectrumReads,4);assert.ok(frames.slice(0,4).every(f=>f.notes.includes(60)));assert.ok(frames.slice(4).every(f=>!f.notes.length));
+});
+
+test('live chord capture, stability and practice gate accept an octave chord exactly once',async t=>{
+  const notes=[41,53,56,60,65],samples=chordSamples(notes),spectrum=spectrumOf(samples);
+  const {frames,spectrumReads}=await capture(t,{samples,spectrum,mode:'chord',suspendOnCapture:true});
+  assert.equal(spectrumReads,8);assert.deepEqual(frames.at(-1).notes,notes);
+  const gate=new NoteGate(80);let count=0;frames.forEach((f,i)=>{if(gate.check(f.notes,notes,i*60,f.onsetId))count++;});assert.equal(count,1);
+});
+
+test('keyboard calibration capture returns a measured profile without retaining audio',async t=>{
+  const samples=chordSamples([36]),spectrum=spectrumOf(samples),{frames}=await capture(t,{samples,spectrum,mode:'calibrate'});
+  assert.equal(frames.at(-1).pitch.note,36);assert.equal(frames.at(-1).profile.length,10);assert.ok(!('samples' in frames.at(-1)));
+});
+
+test('a fresh bright chord strike can retrigger over a ringing tail without a large volume jump',()=>{
+  const onsets=new PianoOnsets(),gate=new NoteGate(80),notes=[41,53,56,60,65];let accepts=0;
+  for(let i=0;i<25;i++){
+    const attack=i===1||i===12,level=i===0?.001:attack?.075:.055,brightness=attack?.008:.002;
+    const onset=onsets.update(level,i*40,brightness);if(gate.check(notes,notes,i*40,onset))accepts++;
+  }
+  assert.equal(accepts,2);
+  for(let i=25;i<60;i++)assert.equal(gate.check(notes,notes,i*40,onsets.update(.055,i*40,.002)),false,'held chord cannot invent strikes');
 });

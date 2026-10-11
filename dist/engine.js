@@ -49,28 +49,7 @@ export function detectPitch(samples,sampleRate,minHz=55,maxHz=2200){
   return {note,hz,confidence:1-b,cents:(midi-note)*100};
 }
 
-// Conservative harmonic suppression for experimental chord listening.
-// Fundamentals must be visible; isolated harmonics cannot become guessed notes.
-export function detectChord(db,sampleRate,fftSize,thresholdDb=-65){
-  const peaks=[];
-  for(let i=2;i<Math.min(db.length-1,Math.ceil(4400*fftSize/sampleRate));i++){
-    if(db[i]<thresholdDb||db[i]<=db[i-1]||db[i]<db[i+1])continue;
-    const shift=0.5*(db[i-1]-db[i+1])/(db[i-1]-2*db[i]+db[i+1]||1);
-    const hz=(i+Math.max(-0.5,Math.min(.5,shift)))*sampleRate/fftSize;
-    if(hz<65)continue;
-    const exact=69+12*Math.log2(hz/440),note=Math.round(exact);
-    if(note<36||note>96||Math.abs(note-exact)>.32)continue;
-    peaks.push({note,hz,db:db[i]});
-  }
-  const loudest=Math.max(-120,...peaks.map(p=>p.db));
-  const candidates=peaks.filter(p=>p.db>loudest-23).sort((a,b)=>a.hz-b.hz);
-  const accepted=[];
-  for(const p of candidates){
-    const harmonic=accepted.some(low=>{const r=p.hz/low.hz,h=Math.round(r);return h>=2&&h<=8&&Math.abs(1200*Math.log2(r/h))<35&&p.db<low.db+4;});
-    if(!harmonic&&!accepted.some(a=>a.note===p.note))accepted.push(p);
-  }
-  return accepted.slice(0,6).map(p=>p.note);
-}
+export {detectPianoChord as detectChord} from './chords.js';
 
 // Standard MIDI files, formats 0 and 1, PPQ timing with tempo changes.
 export function parseMidi(buffer,split=60){
