@@ -7,9 +7,9 @@ function pianoFrame(note,noise=0,volume=.12,sampleRate=48000){
   let seed=123;const f=frequency(note);
   return Float32Array.from({length:8192},(_,i)=>{seed=(1664525*seed+1013904223)>>>0;return volume*(Math.sin(2*Math.PI*f*i/sampleRate)+.5*Math.sin(4*Math.PI*f*i/sampleRate))+noise*(seed/2**31-1);});
 }
-async function capture(t,{samples=pianoFrame(60),suspendOnCapture=false,noise=.003,sampleRate=48000}={}){
-  let tick;const frames=[];const track={stop(){},muted:false,readyState:'live'};
-  const ctx={state:'suspended',sampleRate,currentTime:0,destination:{},resume:async()=>{ctx.state='running';},createMediaStreamSource:()=>({connect(){},disconnect(){}}),createAnalyser:()=>({connect(){},disconnect(){},getFloatTimeDomainData(out){out.set(samples);},getFloatFrequencyData(out){out.fill(-100);}}),createGain:()=>({gain:{value:0},connect(){},disconnect(){}})};
+async function capture(t,{samples=pianoFrame(60),suspendOnCapture=false,noise=.003,sampleRate=48000,mode='single'}={}){
+  let tick,spectrumReads=0;const frames=[];const track={stop(){},muted:false,readyState:'live'};
+  const ctx={state:'suspended',sampleRate,currentTime:0,destination:{},resume:async()=>{ctx.state='running';},createMediaStreamSource:()=>({connect(){},disconnect(){}}),createAnalyser:()=>({connect(){},disconnect(){},getFloatTimeDomainData(out){out.set(samples);},getFloatFrequencyData(out){spectrumReads++;out.fill(-100);}}),createGain:()=>({gain:{value:0},connect(){},disconnect(){}})};
   t.mock.method(globalThis,'setInterval',fn=>{tick=fn;return 123;});
   t.mock.method(globalThis,'clearInterval',()=>{});
   const oldWindow=Object.getOwnPropertyDescriptor(globalThis,'window'),oldNavigator=Object.getOwnPropertyDescriptor(globalThis,'navigator');
@@ -17,9 +17,9 @@ async function capture(t,{samples=pianoFrame(60),suspendOnCapture=false,noise=.0
   Object.defineProperty(globalThis,'navigator',{configurable:true,value:{audioSession:{type:'auto'},mediaDevices:{getUserMedia:async()=>{if(suspendOnCapture)ctx.state='suspended';return {getTracks:()=>[track],getAudioTracks:()=>[track]};}}}});
   t.after(()=>{if(oldWindow)Object.defineProperty(globalThis,'window',oldWindow);else delete globalThis.window;if(oldNavigator)Object.defineProperty(globalThis,'navigator',oldNavigator);else delete globalThis.navigator;});
   const audio=new PianoAudio();audio.noise=noise;t.after(()=>audio.stopMic());
-  await audio.listen(frame=>frames.push(frame));
+  await audio.listen(frame=>frames.push(frame),{mode});
   for(let i=0;i<8;i++){ctx.currentTime+=.06;tick();}
-  return {frames,ctx};
+  return {frames,ctx,spectrumReads};
 }
 test('capture resumes processing after Safari suspends context when opening microphone',async t=>{
   const {frames,ctx}=await capture(t,{suspendOnCapture:true});
@@ -69,4 +69,9 @@ test('two repeated strikes advance twice despite a ringing tail; a held note adv
   assert.equal(count,2);
   for(let i=levels.length;i<80;i++)if(gate.check([64],[64],i*40,onsets.update(.018,i*40)))count++;
   assert.equal(count,2,'steady input does not invent further strikes');
+});
+
+test('live capture can switch listening method between notes without altering the score',async t=>{
+ let queries=0;const {frames,spectrumReads}=await capture(t,{mode:()=>++queries<=4?'single':'chord'});
+ assert.equal(spectrumReads,4);assert.ok(frames.slice(0,4).every(f=>f.notes.includes(60)));assert.ok(frames.slice(4).every(f=>!f.notes.length));
 });

@@ -7,8 +7,8 @@ export const isBlack=n=>[1,3,6,8,10].includes(n%12);
 export class NoteGate {
   constructor(holdMs=100){this.holdMs=holdMs;this.reset();}
   reset(){this.since=null;this.release=[];this.quietSince=null;this.onsetUsed=0;}
-  check(heard,expected,now,onsetId=0){
-    const actual=[...new Set(heard)].sort((a,b)=>a-b);
+  check(heard,expected,now,onsetId=0,allowedHeld=[]){
+    const actual=[...new Set(heard)].filter(n=>expected.includes(n)||!allowedHeld.includes(n)).sort((a,b)=>a-b);
     if(actual.length&&onsetId>this.onsetUsed){this.onsetUsed=onsetId;this.release=[];this.quietSince=null;}
     if(this.release.length){
       // A new, disjoint pitch is itself evidence of release. Do not consume its
@@ -117,7 +117,9 @@ export function parseMidi(buffer,split=60){
 }
 export function groupNotes(notes,hand='both'){
   const groups=[];
-  for(const note of notes){if(hand!=='both'&&note.hand!==hand)continue;let group=groups.at(-1);if(!group||note.time-group.time>.035){group={time:note.time,notes:[]};groups.push(group);}if(!group.notes.some(n=>n.pitch===note.pitch))group.notes.push(note);}
+  // Only share genuinely simultaneous onsets. A 35 ms window swallowed fast
+  // arpeggios; pitch deduplication also discarded voices after octave fitting.
+  for(const note of notes){if(hand!=='both'&&note.hand!==hand)continue;const onset=note.onset??note.time;let group=groups.at(-1);if(!group||onset-group.time>.001){group={time:onset,notes:[]};groups.push(group);}group.notes.push(note);}
   return groups;
 }
 
@@ -164,15 +166,14 @@ export function suggestFingers(notes){
   return result;
 }
 
-export function practiceGroups(notes,hand='both',single=true){
-  const groups=groupNotes(notes,hand);
-  if(!single)return groups;
-  const out=[];
-  for(let i=0;i<groups.length;i++){
-    const g=groups[i],step=Math.min(.25,((groups[i+1]?.time??g.time+1)-g.time)/Math.max(1,g.notes.length));
-    g.notes.sort((a,b)=>a.pitch-b.pitch).forEach((note,j)=>out.push({time:g.time+j*step,notes:[note]}));
-  }
-  return out;
+// The score is independent of practice mode and microphone recognition.
+// Practice, seven-repeat sections and demo all use this exact event sequence.
+export function practiceGroups(notes,hand='both'){return groupNotes(notes,hand);}
+
+// Scores transcribed from videos keep video timestamps. Starting inside a held
+// chord includes the still-sounding notes and never slides the next attack early.
+export function trimScore(notes,start=0){
+  return notes.map((n,i)=>({...n,id:n.id??i})).filter(n=>n.time+n.duration>start+.001).map(n=>({...n,time:Math.max(0,n.time-start),...(n.onset===undefined?{}:{onset:Math.max(0,n.onset-start)}),duration:n.duration-Math.max(0,start-n.time),continuation:n.time<start-.001}));
 }
 
 const warmNotes=[];

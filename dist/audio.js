@@ -61,8 +61,9 @@ export class PianoAudio {
     this.timer=setInterval(()=>{
       if(ctx.state!=='running'){onFrame({notes:[],level:0,interrupted:true});return;}
       this.analyser.getFloatTimeDomainData(data);
-      if(mode==='chord')this.analyser.getFloatFrequencyData(spectrum);
-      const frame=analyzeMicrophoneFrame(data,ctx.sampleRate,{noise:this.noise,sensitivity,mode,spectrum});
+      const frameMode=typeof mode==='function'?mode():mode;
+      if(frameMode==='chord')this.analyser.getFloatFrequencyData(spectrum);
+      const frame=analyzeMicrophoneFrame(data,ctx.sampleRate,{noise:this.noise,sensitivity,mode:frameMode,spectrum});
       onFrame({...frame,onsetId:onsets.update(frame.level,ctx.currentTime*1000),interrupted:false,muted:stream.getAudioTracks()[0].muted});
     },40);
     return true;
